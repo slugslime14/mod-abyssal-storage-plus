@@ -9,6 +9,7 @@
 #include "ObjectMgr.h"
 #include "QuestDef.h"
 #include "Log.h"
+#include "WorldSessionMgr.h"
 #include <cctype>
 
 AbyssalPlayerData* GetAbyssalData(Player* player)
@@ -46,14 +47,9 @@ void AbyssalStoragePlusMgr::LoadAccountData(uint32 accountId)
         } while (result->NextRow());
     }
 
+    // emplace, not assign: never replace a copy that is already in use
     std::lock_guard<std::mutex> lock(_storageMutex);
-    _storage[accountId] = std::move(items);
-}
-
-void AbyssalStoragePlusMgr::UnloadAccountData(uint32 accountId)
-{
-    std::lock_guard<std::mutex> lock(_storageMutex);
-    _storage.erase(accountId);
+    _storage.emplace(accountId, std::move(items));
 }
 
 bool AbyssalStoragePlusMgr::IsAccountLoaded(uint32 accountId)
@@ -62,19 +58,29 @@ bool AbyssalStoragePlusMgr::IsAccountLoaded(uint32 accountId)
     return _storage.find(accountId) != _storage.end();
 }
 
-void AbyssalStoragePlusMgr::DepositItem(uint32 accountId, uint32 itemEntry, uint32 count)
+// The DB writes below only add or subtract, never set a total. CharacterDatabase can run several
+// async worker threads, so writes may land out of order, and adding/subtracting still adds up.
+void AbyssalStoragePlusMgr::DepositItem(uint32 accountId, uint32 itemEntry, uint32 count,
+    CharacterDatabaseTransaction trans)
 {
+    if (!count)
+        return;
+
     {
         std::lock_guard<std::mutex> lock(_storageMutex);
         _storage[accountId][itemEntry] += count;
     }
 
-    CharacterDatabase.Execute("INSERT INTO abyssal_storage (account_id, item_entry, count) VALUES ({}, {}, {}) "
+    trans->Append("INSERT INTO abyssal_storage (account_id, item_entry, count) VALUES ({}, {}, {}) "
         "ON DUPLICATE KEY UPDATE count = count + {}", accountId, itemEntry, count, count);
 }
 
-bool AbyssalStoragePlusMgr::WithdrawItem(uint32 accountId, uint32 itemEntry, uint32 count)
+bool AbyssalStoragePlusMgr::WithdrawItem(uint32 accountId, uint32 itemEntry, uint32 count,
+    CharacterDatabaseTransaction trans)
 {
+    if (!count)
+        return false;
+
     std::lock_guard<std::mutex> lock(_storageMutex);
 
     auto accIt = _storage.find(accountId);
@@ -86,19 +92,23 @@ bool AbyssalStoragePlusMgr::WithdrawItem(uint32 accountId, uint32 itemEntry, uin
         return false;
 
     itemIt->second -= count;
-
     if (itemIt->second == 0)
-    {
         accIt->second.erase(itemIt);
-        CharacterDatabase.Execute("DELETE FROM abyssal_storage WHERE account_id = {} AND item_entry = {}", accountId, itemEntry);
-    }
-    else
-    {
-        CharacterDatabase.Execute("UPDATE abyssal_storage SET count = {} WHERE account_id = {} AND item_entry = {}",
-            itemIt->second, accountId, itemEntry);
-    }
+
+    trans->Append("UPDATE abyssal_storage SET count = count - {} "
+        "WHERE account_id = {} AND item_entry = {} AND count >= {}", count, accountId, itemEntry, count);
+    trans->Append("DELETE FROM abyssal_storage WHERE account_id = {} AND item_entry = {} AND count = 0",
+        accountId, itemEntry);
 
     return true;
+}
+
+// Without this, a crash before the next character save could leave an item in both the vault and
+// the bags, or in neither
+void AbyssalStoragePlusMgr::CommitWithInventory(Player* player, CharacterDatabaseTransaction trans)
+{
+    player->SaveInventoryAndGoldToDB(trans);
+    CharacterDatabase.CommitTransaction(trans);
 }
 
 uint32 AbyssalStoragePlusMgr::GetItemCount(uint32 accountId, uint32 itemEntry)
@@ -161,7 +171,7 @@ bool AbyssalStoragePlusMgr::IsItemRequiredByActiveQuest(Player* player, uint32 i
     return reserved > 0 && player->GetItemCount(itemId) <= reserved;
 }
 
-bool AbyssalStoragePlusMgr::ShouldAutoStore(Player* player, ItemTemplate const* itemTemplate)
+bool AbyssalStoragePlusMgr::IsVaultable(ItemTemplate const* itemTemplate) const
 {
     if (!itemTemplate)
         return false;
@@ -180,6 +190,14 @@ bool AbyssalStoragePlusMgr::ShouldAutoStore(Player* player, ItemTemplate const* 
 
     // Kits, grinders, and lockpicks lack TotemCategory data
     if (itemTemplate->ItemId == 20815 || itemTemplate->ItemId == 20824 || itemTemplate->ItemId == 7872)
+        return false;
+
+    return true;
+}
+
+bool AbyssalStoragePlusMgr::ShouldAutoStore(Player* player, ItemTemplate const* itemTemplate)
+{
+    if (!IsVaultable(itemTemplate))
         return false;
 
     if (IsItemRequiredByActiveQuest(player, itemTemplate->ItemId))
@@ -316,6 +334,15 @@ void AbyssalStoragePlusMgr::SendFullSync(Player* player)
     SendAddonMessage(player, msg);
 }
 
+// An altbot shares its owner's account and so its vault. Returns the owner's character when it
+// isn't the one that changed the vault, so their addon can be kept up to date too.
+static Player* GetOtherAccountPlayer(Player* player)
+{
+    WorldSession* session = sWorldSessionMgr->FindSession(player->GetSession()->GetAccountId());
+    Player* owner = session ? session->GetPlayer() : nullptr;
+    return owner != player ? owner : nullptr;
+}
+
 void AbyssalStoragePlusMgr::SendItemUpdate(Player* player, uint32 itemEntry, uint32 count)
 {
     // Include bag+vault total so the client can render without a mid-move race
@@ -323,10 +350,14 @@ void AbyssalStoragePlusMgr::SendItemUpdate(Player* player, uint32 itemEntry, uin
     std::string msg = "UPD:" + std::to_string(itemEntry) + "," + std::to_string(count)
         + "," + std::to_string(bagCount + count);
     SendAddonMessage(player, msg);
+    if (Player* owner = GetOtherAccountPlayer(player))
+        SendAddonMessage(owner, msg);
 }
 
 void AbyssalStoragePlusMgr::SendItemDelete(Player* player, uint32 itemEntry)
 {
     std::string msg = "DEL:" + std::to_string(itemEntry);
     SendAddonMessage(player, msg);
+    if (Player* owner = GetOtherAccountPlayer(player))
+        SendAddonMessage(owner, msg);
 }

@@ -61,6 +61,9 @@ static void RevaultMaterializedItems(Player* player, AbyssalPlayerData* data, ui
     if (!player || !data || data->materializedItems.empty())
         return;
 
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    bool changed = false;
+
     data->isMaterializing = true;
     for (auto const& [entry, mat] : data->materializedItems)
     {
@@ -77,12 +80,72 @@ static void RevaultMaterializedItems(Player* player, AbyssalPlayerData* data, ui
             sAbyssalStoragePlusMgr->GetItemCount(accountId, entry));
 
         player->DestroyItemCount(entry, leftover, true);
-        sAbyssalStoragePlusMgr->DepositItem(accountId, entry, leftover);
+        sAbyssalStoragePlusMgr->DepositItem(accountId, entry, leftover, trans);
         sAbyssalStoragePlusMgr->SendItemUpdate(player, entry,
             sAbyssalStoragePlusMgr->GetItemCount(accountId, entry));
+        changed = true;
     }
     data->materializedItems.clear();
     data->isMaterializing = false;
+
+    if (changed)
+        sAbyssalStoragePlusMgr->CommitWithInventory(player, trans);
+}
+
+static void DepositPendingItems(Player* player, AbyssalPlayerData* data)
+{
+    if (data->pendingDeposits.empty())
+        return;
+
+    // Move pending list out so we don't re-enter if DestroyItemCount triggers hooks
+    std::vector<PendingDeposit> deposits = std::move(data->pendingDeposits);
+    data->pendingDeposits.clear();
+
+    uint32 accountId = player->GetSession()->GetAccountId();
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    bool changed = false;
+
+    for (auto const& dep : deposits)
+    {
+        // Verify the player still has the items (they may have been used/moved)
+        uint32 playerHas = player->GetItemCount(dep.itemEntry);
+        uint32 toDeposit = std::min(dep.count, playerHas);
+        if (toDeposit == 0)
+            continue;
+
+        // Never deposit below the quest-required threshold — guards against
+        // timing races where item->GetCount() or quest status was stale when queued
+        uint32 questReserved = sAbyssalStoragePlusMgr->GetQuestReservedCount(player, dep.itemEntry);
+        if (playerHas <= questReserved)
+            continue;
+        toDeposit = std::min(toDeposit, playerHas - questReserved);
+
+        player->DestroyItemCount(dep.itemEntry, toDeposit, true);
+        sAbyssalStoragePlusMgr->DepositItem(accountId, dep.itemEntry, toDeposit, trans);
+        changed = true;
+
+        uint32 newTotal = sAbyssalStoragePlusMgr->GetItemCount(accountId, dep.itemEntry);
+        sAbyssalStoragePlusMgr->SendItemUpdate(player, dep.itemEntry, newTotal);
+    }
+
+    if (changed)
+        sAbyssalStoragePlusMgr->CommitWithInventory(player, trans);
+}
+
+// Takes count of itemEntry out of the vault and puts it in the player's bags. Withdrawing first
+// means two characters of one account can't both take the same items.
+static Item* MaterializeItem(Player* player, ItemPosCountVec const& dest, uint32 itemEntry, uint32 count,
+    CharacterDatabaseTransaction trans)
+{
+    uint32 accountId = player->GetSession()->GetAccountId();
+    if (!sAbyssalStoragePlusMgr->WithdrawItem(accountId, itemEntry, count, trans))
+        return nullptr;
+
+    Item* item = player->StoreNewItem(dest, itemEntry, true);
+    if (!item)
+        sAbyssalStoragePlusMgr->DepositItem(accountId, itemEntry, count, trans);
+
+    return item;
 }
 
 // Push current bag+vault totals for each reagent of a spell
@@ -102,7 +165,7 @@ static void SendSpellReagentTotals(Player* player, SpellInfo const* spellInfo, u
 }
 
 // Pull up to amount of one item from the vault into bags, returning how many fit
-static uint32 PullQuestMaterials(Player* player, uint32 accountId, uint32 itemEntry, uint32 amount)
+static uint32 PullQuestMaterials(Player* player, uint32 itemEntry, uint32 amount, CharacterDatabaseTransaction trans)
 {
     if (!player || amount == 0)
         return 0;
@@ -131,15 +194,8 @@ static uint32 PullQuestMaterials(Player* player, uint32 accountId, uint32 itemEn
         if (result != EQUIP_ERR_OK)
             break;
 
-        if (!player->StoreNewItem(dest, itemEntry, true))
+        if (!MaterializeItem(player, dest, itemEntry, chunk, trans))
             break;
-
-        if (!sAbyssalStoragePlusMgr->WithdrawItem(accountId, itemEntry, chunk))
-        {
-            // Vault debit failed; undo the store so nothing is duplicated
-            player->DestroyItemCount(itemEntry, chunk, true);
-            break;
-        }
 
         pulled += chunk;
         amount -= chunk;
@@ -174,7 +230,7 @@ class AbyssalStoragePlusPlayerScript : public PlayerScript
 public:
     AbyssalStoragePlusPlayerScript() : PlayerScript("AbyssalStoragePlusPlayerScript", {
         PLAYERHOOK_ON_LOGIN,
-        PLAYERHOOK_ON_LOGOUT,
+        PLAYERHOOK_ON_BEFORE_LOGOUT,
         PLAYERHOOK_ON_UPDATE,
         PLAYERHOOK_ON_STORE_NEW_ITEM,
         PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT
@@ -193,24 +249,20 @@ public:
         sAbyssalStoragePlusMgr->SendFullSync(player);
     }
 
-    void OnPlayerLogout(Player* player) override
+    // Before logout, not on it: OnPlayerLogout runs after the character is saved, so items taken
+    // from the bags there would still be in the saved character as well as in the vault.
+    // The account's vault stays cached; another character of the account may still be online.
+    void OnPlayerBeforeLogout(Player* player) override
     {
         if (!sAbyssalStoragePlusMgr->IsEnabled())
             return;
 
-        if (sAbyssalStoragePlusMgr->IsBotAccount(player))
+        AbyssalPlayerData* data = player->CustomData.Get<AbyssalPlayerData>("AbyssalData");
+        if (!data)
             return;
 
-        uint32 accountId = player->GetSession()->GetAccountId();
-        AbyssalPlayerData* data = GetAbyssalData(player);
-
-        // Re-vault any materialized items still in inventory
-        RevaultMaterializedItems(player, data, accountId);
-
-        // Check if any other character on this account is online
-        // For simplicity, always unload — LoadAccountData will re-cache on next login
-        // A more efficient approach would reference-count, but this is safe
-        sAbyssalStoragePlusMgr->UnloadAccountData(accountId);
+        DepositPendingItems(player, data);
+        RevaultMaterializedItems(player, data, player->GetSession()->GetAccountId());
     }
 
     void OnPlayerStoreNewItem(Player* player, Item* item, uint32 count) override
@@ -255,33 +307,7 @@ public:
         if (sAbyssalStoragePlusMgr->IsBotAccount(player))
             return;
 
-        // Move pending list out so we don't re-enter if DestroyItemCount triggers hooks
-        std::vector<PendingDeposit> deposits = std::move(data->pendingDeposits);
-        data->pendingDeposits.clear();
-
-        uint32 accountId = player->GetSession()->GetAccountId();
-
-        for (auto const& dep : deposits)
-        {
-            // Verify the player still has the items (they may have been used/moved)
-            uint32 playerHas = player->GetItemCount(dep.itemEntry);
-            uint32 toDeposit = std::min(dep.count, playerHas);
-            if (toDeposit == 0)
-                continue;
-
-            // Never deposit below the quest-required threshold — guards against
-            // timing races where item->GetCount() or quest status was stale when queued
-            uint32 questReserved = sAbyssalStoragePlusMgr->GetQuestReservedCount(player, dep.itemEntry);
-            if (playerHas <= questReserved)
-                continue;
-            toDeposit = std::min(toDeposit, playerHas - questReserved);
-
-            player->DestroyItemCount(dep.itemEntry, toDeposit, true);
-            sAbyssalStoragePlusMgr->DepositItem(accountId, dep.itemEntry, toDeposit);
-
-            uint32 newTotal = sAbyssalStoragePlusMgr->GetItemCount(accountId, dep.itemEntry);
-            sAbyssalStoragePlusMgr->SendItemUpdate(player, dep.itemEntry, newTotal);
-        }
+        DepositPendingItems(player, data);
     }
 
     void OnPlayerQuestAccept(Player* player, Quest const* quest) override
@@ -306,6 +332,8 @@ public:
         uint32 accountId = player->GetSession()->GetAccountId();
         AbyssalPlayerData* data = GetAbyssalData(player);
         bool previousAutoStore = data ? data->autoStoreEnabled : true;
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+        bool changed = false;
         if (data)
             data->autoStoreEnabled = false;
 
@@ -326,7 +354,7 @@ public:
                 continue;
 
             uint32 wanted = std::min(missing, vaultCount);
-            uint32 pulled = PullQuestMaterials(player, accountId, itemEntry, wanted);
+            uint32 pulled = PullQuestMaterials(player, itemEntry, wanted, trans);
 
             if (pulled == 0)
             {
@@ -336,6 +364,7 @@ public:
                 continue;
             }
 
+            changed = true;
             uint32 newVaultCount = sAbyssalStoragePlusMgr->GetItemCount(accountId, itemEntry);
             if (newVaultCount > 0)
                 sAbyssalStoragePlusMgr->SendItemUpdate(player, itemEntry, newVaultCount);
@@ -358,6 +387,9 @@ public:
 
         if (data)
             data->autoStoreEnabled = previousAutoStore;
+
+        if (changed)
+            sAbyssalStoragePlusMgr->CommitWithInventory(player, trans);
     }
 };
 
@@ -432,6 +464,9 @@ public:
         }
 
         // Second pass: materialize deficits
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+        bool changed = false;
+        bool failed = false;
         data->isMaterializing = true;
         for (uint8 i = 0; i < MAX_SPELL_REAGENTS; ++i)
         {
@@ -454,21 +489,33 @@ public:
             InventoryResult invResult = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, reagentEntry, deficit);
             if (invResult != EQUIP_ERR_OK)
             {
-                // Roll back reagents pulled for earlier slots
-                RevaultMaterializedItems(player, data, accountId);
                 res = SPELL_FAILED_DONT_REPORT;
                 ChatHandler(player->GetSession()).SendSysMessage("Abyssal Storage Plus: Not enough bag space to materialize crafting reagents.");
-                return;
+                failed = true;
+                break;
             }
 
-            Item* newItem = player->StoreNewItem(dest, reagentEntry, true);
-            if (newItem)
-                TrackMaterializedItem(data, uint32(reagentEntry), playerHas, deficit);
+            // Another character of the account may have taken them since the first pass
+            Item* newItem = MaterializeItem(player, dest, reagentEntry, deficit, trans);
+            if (!newItem)
+            {
+                res = SPELL_FAILED_REAGENTS;
+                failed = true;
+                break;
+            }
 
-            sAbyssalStoragePlusMgr->WithdrawItem(accountId, reagentEntry, deficit);
+            TrackMaterializedItem(data, uint32(reagentEntry), playerHas, deficit);
+            changed = true;
             sAbyssalStoragePlusMgr->SendItemUpdate(player, reagentEntry, sAbyssalStoragePlusMgr->GetItemCount(accountId, reagentEntry));
         }
         data->isMaterializing = false;
+
+        if (changed)
+            sAbyssalStoragePlusMgr->CommitWithInventory(player, trans);
+
+        // Roll back reagents pulled for earlier slots
+        if (failed)
+            RevaultMaterializedItems(player, data, accountId);
     }
 
     void OnSpellCast(Spell* /*spell*/, Unit* caster, SpellInfo const* spellInfo, bool /*skipCheck*/) override
@@ -601,11 +648,12 @@ public:
             return true;
         }
 
-        // Disable auto-store BEFORE creating items, otherwise OnPlayerStoreNewItem
+        // Suppress auto-store while creating the items, otherwise OnPlayerStoreNewItem
         // will immediately re-deposit them back into the vault
         AbyssalPlayerData* data = GetAbyssalData(player);
-        if (data)
-            data->autoStoreEnabled = false;
+        data->isMaterializing = true;
+
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
 
         // Add items to player in stacks respecting max stack size
         uint32 remaining = count;
@@ -621,18 +669,19 @@ public:
                 break;
             }
 
-            player->StoreNewItem(dest, itemEntry, true);
-            sAbyssalStoragePlusMgr->WithdrawItem(accountId, itemEntry, stackSize);
+            if (!MaterializeItem(player, dest, itemEntry, stackSize, trans))
+                break;
+
             remaining -= stackSize;
         }
 
-        // Re-enable auto-store even if the withdrawal stopped early
-        if (data)
-            data->autoStoreEnabled = true;
+        data->isMaterializing = false;
 
         uint32 withdrawn = count - remaining;
         if (withdrawn > 0)
         {
+            sAbyssalStoragePlusMgr->CommitWithInventory(player, trans);
+
             uint32 newCount = sAbyssalStoragePlusMgr->GetItemCount(accountId, itemEntry);
             if (newCount > 0)
                 sAbyssalStoragePlusMgr->SendItemUpdate(player, itemEntry, newCount);
@@ -678,6 +727,7 @@ public:
         if (data)
             data->autoStoreEnabled = false;
 
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
         uint32 maxStack = std::max<uint32>(proto->GetMaxStackSize(), 1);
         uint32 remaining = toWithdraw;
         uint32 stored = 0;
@@ -689,8 +739,9 @@ public:
             if (result != EQUIP_ERR_OK)
                 break;
 
-            player->StoreNewItem(dest, itemEntry, true);
-            sAbyssalStoragePlusMgr->WithdrawItem(accountId, itemEntry, chunk);
+            if (!MaterializeItem(player, dest, itemEntry, chunk, trans))
+                break;
+
             stored += chunk;
             remaining -= chunk;
         }
@@ -705,6 +756,8 @@ public:
 
         if (stored > 0)
         {
+            sAbyssalStoragePlusMgr->CommitWithInventory(player, trans);
+
             uint32 newCount = sAbyssalStoragePlusMgr->GetItemCount(accountId, itemEntry);
             if (newCount > 0)
                 sAbyssalStoragePlusMgr->SendItemUpdate(player, itemEntry, newCount);
@@ -841,7 +894,9 @@ public:
                 player->DestroyItemCount(itemEntry, count, true);
             }
 
-            sAbyssalStoragePlusMgr->DepositItem(accountId, itemEntry, count);
+            CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+            sAbyssalStoragePlusMgr->DepositItem(accountId, itemEntry, count, trans);
+            sAbyssalStoragePlusMgr->CommitWithInventory(player, trans);
 
             AbyssalPlayerData* data = GetAbyssalData(player);
             if (data)
@@ -867,7 +922,7 @@ public:
                     if (!item)
                         continue;
 
-                    if (sAbyssalStoragePlusMgr->ShouldAutoStore(player, item->GetTemplate()))
+                    if (sAbyssalStoragePlusMgr->IsVaultable(item->GetTemplate()))
                         toDeposit[item->GetEntry()] += item->GetCount();
                 }
             }
@@ -880,11 +935,12 @@ public:
             if (!item)
                 continue;
 
-            if (sAbyssalStoragePlusMgr->ShouldAutoStore(player, item->GetTemplate()))
+            if (sAbyssalStoragePlusMgr->IsVaultable(item->GetTemplate()))
                 toDeposit[item->GetEntry()] += item->GetCount();
         }
 
         // Now destroy and deposit in one pass per item entry
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
         uint32 depositedCount = 0;
         for (auto const& [entry, count] : toDeposit)
         {
@@ -897,9 +953,12 @@ public:
                 continue;
 
             player->DestroyItemCount(entry, toMove, true);
-            sAbyssalStoragePlusMgr->DepositItem(accountId, entry, toMove);
+            sAbyssalStoragePlusMgr->DepositItem(accountId, entry, toMove, trans);
             ++depositedCount;
         }
+
+        if (depositedCount)
+            sAbyssalStoragePlusMgr->CommitWithInventory(player, trans);
 
         AbyssalPlayerData* data = GetAbyssalData(player);
         if (data)
@@ -1062,8 +1121,11 @@ public:
         craftCount = std::min(craftCount, maxCrafts);
 
         AbyssalPlayerData* data = GetAbyssalData(player);
-        if (data)
-            data->isMaterializing = true;
+        data->isMaterializing = true;
+
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+        bool changed = false;
+        bool failed = false;
 
         // Materialize reagents needed for craftCount crafts (at most 1 stack per type)
         for (auto const& r : reagents)
@@ -1085,28 +1147,40 @@ public:
             InventoryResult invResult = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, r.entry, toWithdraw);
             if (invResult != EQUIP_ERR_OK)
             {
-                // Roll back reagents pulled for earlier types
-                if (data)
-                    RevaultMaterializedItems(player, data, accountId);
                 handler->SendSysMessage("Abyssal Storage Plus: Not enough bag space for reagents.");
-                return true;
+                failed = true;
+                break;
             }
 
-            Item* newItem = player->StoreNewItem(dest, r.entry, true);
-            if (newItem && data)
-                TrackMaterializedItem(data, r.entry, r.playerHas, toWithdraw);
+            // Another character of the account may have taken them since they were counted
+            Item* newItem = MaterializeItem(player, dest, r.entry, toWithdraw, trans);
+            if (!newItem)
+            {
+                handler->SendSysMessage("Abyssal Storage Plus: Not enough reagents.");
+                failed = true;
+                break;
+            }
 
-            sAbyssalStoragePlusMgr->WithdrawItem(accountId, r.entry, toWithdraw);
+            TrackMaterializedItem(data, r.entry, r.playerHas, toWithdraw);
+            changed = true;
             sAbyssalStoragePlusMgr->SendItemUpdate(player, r.entry, sAbyssalStoragePlusMgr->GetItemCount(accountId, r.entry));
         }
 
-        if (data)
+        data->isMaterializing = false;
+
+        if (changed)
+            sAbyssalStoragePlusMgr->CommitWithInventory(player, trans);
+
+        if (failed)
         {
-            data->isMaterializing = false;
-            data->autoStoreEnabled = false; // prevent re-deposit of withdrawn reagents
-            data->pendingCrafts = craftCount;  // OnSpellCast will decrement and re-cast
-            data->pendingSpellId = spellId;
+            // Return what was already materialized
+            RevaultMaterializedItems(player, data, accountId);
+            return true;
         }
+
+        data->autoStoreEnabled = false; // prevent re-deposit of withdrawn reagents
+        data->pendingCrafts = craftCount;  // OnSpellCast will decrement and re-cast
+        data->pendingSpellId = spellId;
 
         // Cast once — OnSpellCast will chain the remaining crafts
         SpellCastResult castResult = player->CastSpell(player, spellId, false);
