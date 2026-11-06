@@ -1052,7 +1052,7 @@ public:
             }
 
             ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(reagentEntry);
-            uint32 maxStack = tmpl ? tmpl->GetMaxStackSize() : 1;
+            uint32 maxStack = tmpl ? std::max<uint32>(tmpl->GetMaxStackSize(), 1) : 1;
 
             reagents.push_back({ reagentEntry, reagentCount, playerHas, vaultHas, maxStack });
         }
@@ -1076,21 +1076,6 @@ public:
             }
         }
 
-        // Count how many distinct reagents need vault withdrawal
-        uint32 vaultReagentSlots = 0;
-        for (auto const& r : reagents)
-        {
-            if (r.playerHas < r.perCraft)
-                vaultReagentSlots++;
-        }
-
-        // Need: 1 slot per vault reagent type + 1 for the crafted product
-        if (freeSlots < vaultReagentSlots + 1)
-        {
-            handler->SendSysMessage("Abyssal Storage Plus: Not enough bag space (need room for reagents + product).");
-            return true;
-        }
-
         // Cap craft count by total available reagents (inventory + vault)
         uint32 maxCrafts = craftCount;
         for (auto const& r : reagents)
@@ -1099,22 +1084,33 @@ public:
             maxCrafts = std::min(maxCrafts, possible);
         }
 
-        // Cap further: each vault reagent gets at most 1 max-stack of bag space,
-        // so the amount we can withdraw is limited
-        for (auto const& r : reagents)
-        {
-            if (r.playerHas >= r.perCraft * maxCrafts)
-                continue; // inventory alone covers this reagent for maxCrafts
-
-            // Available in bags = what player already has + up to 1 max stack from vault
-            uint32 availableInBags = r.playerHas + std::min(r.vaultHas, r.maxStack);
-            uint32 possible = availableInBags / r.perCraft;
-            maxCrafts = std::min(maxCrafts, possible);
-        }
-
         if (maxCrafts == 0)
         {
             handler->SendSysMessage("Abyssal Storage Plus: Not enough reagents.");
+            return true;
+        }
+
+        // Each stack pulled from the vault needs a free slot, plus one for the crafted product.
+        // A recipe can need more than one stack of a reagent, so count stacks, not reagent types,
+        // and craft fewer if the bags can't hold the reagents for all of them.
+        auto slotsNeeded = [&reagents](uint32 crafts)
+        {
+            uint32 slots = 1;
+            for (auto const& r : reagents)
+            {
+                uint32 totalNeeded = r.perCraft * crafts;
+                if (r.playerHas < totalNeeded)
+                    slots += (totalNeeded - r.playerHas + r.maxStack - 1) / r.maxStack;
+            }
+            return slots;
+        };
+
+        while (maxCrafts > 0 && slotsNeeded(maxCrafts) > freeSlots)
+            --maxCrafts;
+
+        if (maxCrafts == 0)
+        {
+            handler->SendSysMessage("Abyssal Storage Plus: Not enough bag space (need room for reagents + product).");
             return true;
         }
 
@@ -1127,7 +1123,7 @@ public:
         bool changed = false;
         bool failed = false;
 
-        // Materialize reagents needed for craftCount crafts (at most 1 stack per type)
+        // Materialize reagents needed for craftCount crafts
         for (auto const& r : reagents)
         {
             uint32 totalNeeded = r.perCraft * craftCount;
